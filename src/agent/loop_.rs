@@ -12,10 +12,17 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
+
+thread_local! {
+    static JSON_EXTRACT_BUF: RefCell<Vec<serde_json::Value>> = RefCell::new(Vec::new());
+    static RECALL_CACHE: RefCell<RecallCache> = RefCell::new(RecallCache::new());
+}
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -29,6 +36,38 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
+const RECALL_CACHE_SIZE: usize = 10;
+
+struct RecallCache {
+    entries: VecDeque<(String, Vec<memory::MemoryEntry>)>,
+}
+
+impl RecallCache {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, query: &str) -> Option<&Vec<memory::MemoryEntry>> {
+        self.entries
+            .iter()
+            .find(|(q, _)| q == query)
+            .map(|(_, entries)| entries)
+    }
+
+    fn insert(&mut self, query: String, entries: Vec<memory::MemoryEntry>) {
+        if self.entries.len() >= RECALL_CACHE_SIZE {
+            self.entries.pop_back();
+        }
+        self.entries.push_front((query, entries));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
 
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -218,8 +257,21 @@ async fn auto_compact_history(
 async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
     let mut context = String::new();
 
-    // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    let entries = RECALL_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        cache.get(user_msg).cloned()
+    }).unwrap_or_else(|| {
+        futures::executor::block_on(async {
+            mem.recall(user_msg, 5, None).await.ok()
+        })
+    });
+
+    if let Some(entries) = entries {
+        RECALL_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.insert(user_msg.to_string(), entries.clone());
+        });
+
         let relevant: Vec<_> = entries
             .iter()
             .filter(|e| match e.score {
@@ -519,15 +571,18 @@ fn strip_leading_close_tags(mut input: &str) -> &str {
 /// to make a tool call. Do NOT use this on raw user input or content that
 /// could contain prompt injection payloads.
 fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
-    let mut values = Vec::new();
+    let values = JSON_EXTRACT_BUF.with(|buf| {
+        let buf = buf.borrow_mut();
+        buf.clear();
+        buf
+    });
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return values;
+        return Vec::new();
     }
 
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        values.push(value);
-        return values;
+        return vec![value];
     }
 
     let char_positions: Vec<(usize, char)> = trimmed.char_indices().collect();
@@ -553,7 +608,7 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
         idx += 1;
     }
 
-    values
+    std::mem::take(values)
 }
 
 /// Find the end position of a JSON object by tracking balanced braces.
@@ -1685,6 +1740,7 @@ pub async fn run(
             let _ = mem
                 .store(&user_key, &msg, MemoryCategory::Conversation, None)
                 .await;
+            RECALL_CACHE.with(|cache| cache.borrow_mut().clear());
         }
 
         // Inject memory + hardware RAG context into user message
@@ -1791,6 +1847,7 @@ pub async fn run(
                             }
                         }
                     }
+                    RECALL_CACHE.with(|cache| cache.borrow_mut().clear());
                     if cleared > 0 {
                         println!("Conversation cleared ({cleared} memory entries removed).\n");
                     } else {
@@ -1807,6 +1864,7 @@ pub async fn run(
                 let _ = mem
                     .store(&user_key, &user_input, MemoryCategory::Conversation, None)
                     .await;
+                RECALL_CACHE.with(|cache| cache.borrow_mut().clear());
             }
 
             // Inject memory + hardware RAG context into user message

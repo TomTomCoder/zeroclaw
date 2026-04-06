@@ -68,6 +68,41 @@ impl ChatResponse {
     pub fn text_or_empty(&self) -> &str {
         self.text.as_deref().unwrap_or("")
     }
+
+    pub fn builder() -> ChatResponseBuilder {
+        ChatResponseBuilder::new()
+    }
+}
+
+pub struct ChatResponseBuilder {
+    text: Option<String>,
+    tool_calls: Vec<ToolCall>,
+}
+
+impl ChatResponseBuilder {
+    pub fn new() -> Self {
+        Self {
+            text: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    pub fn text(mut self, text: Option<String>) -> Self {
+        self.text = text;
+        self
+    }
+
+    pub fn tool_calls(mut self, tool_calls: Vec<ToolCall>) -> Self {
+        self.tool_calls = tool_calls;
+        self
+    }
+
+    pub fn build(&self) -> ChatResponse {
+        ChatResponse {
+            text: self.text.clone(),
+            tool_calls: self.tool_calls.clone(),
+        }
+    }
 }
 
 /// Request payload for provider chat calls.
@@ -82,6 +117,174 @@ pub struct ChatRequest<'a> {
 pub struct ToolResultMessage {
     pub tool_call_id: String,
     pub content: String,
+}
+
+/// A cached provider response that enables single-pass parsing.
+///
+/// This type holds the raw response data along with cached parsed components,
+/// avoiding redundant deserialization when the same response is accessed
+/// multiple times (e.g., text extraction followed by tool call extraction).
+#[derive(Debug, Clone)]
+pub struct CachedResponse {
+    raw: String,
+    parsed_text: Option<String>,
+    parsed_tool_calls: Option<Vec<ToolCall>>,
+}
+
+impl CachedResponse {
+    /// Create a new cached response from raw text.
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self {
+            raw: raw.into(),
+            parsed_text: None,
+            parsed_tool_calls: None,
+        }
+    }
+
+    /// Parse the response once, extracting both text and tool calls.
+    /// Subsequent calls return the cached result.
+    pub fn parse_once(&mut self) -> &ChatResponse {
+        if self.parsed_text.is_some() || self.parsed_tool_calls.is_some() {
+            return ChatResponse::builder()
+                .text(self.parsed_text.clone())
+                .tool_calls(self.parsed_tool_calls.clone().unwrap_or_default())
+                .build();
+        }
+
+        let extracted = Self::extract_content(&self.raw);
+        self.parsed_text = extracted.text;
+        self.parsed_tool_calls = Some(extracted.tool_calls);
+
+        ChatResponse::builder()
+            .text(self.parsed_text.clone())
+            .tool_calls(self.parsed_tool_calls.clone().unwrap_or_default())
+            .build()
+    }
+
+    /// Get the text content, parsing if needed.
+    pub fn text(&mut self) -> &str {
+        if self.parsed_text.is_none() {
+            let extracted = Self::extract_content(&self.raw);
+            self.parsed_text = extracted.text;
+            self.parsed_tool_calls = Some(extracted.tool_calls);
+        }
+        self.parsed_text.as_deref().unwrap_or("")
+    }
+
+    /// Get tool calls, parsing if needed.
+    pub fn tool_calls(&mut self) -> &[ToolCall] {
+        if self.parsed_tool_calls.is_none() {
+            let extracted = Self::extract_content(&self.raw);
+            self.parsed_text = extracted.text;
+            self.parsed_tool_calls = Some(extracted.tool_calls);
+        }
+        self.parsed_tool_calls.as_deref().unwrap_or(&[])
+    }
+
+    /// Extract content from raw response in a single pass.
+    fn extract_content(raw: &str) -> ExtractResult {
+        let mut text = None;
+        let mut tool_calls = Vec::new();
+
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+            if let Some(content_val) = value.get("content") {
+                if let Some(arr) = content_val.as_array() {
+                    for block in arr {
+                        if let Some(block_type) = block.get("type").and_then(|t| t.as_str()) {
+                            match block_type {
+                                "text" => {
+                                    if text.is_none() {
+                                        text = block
+                                            .get("text")
+                                            .and_then(|t| t.as_str())
+                                            .filter(|t| !t.is_empty())
+                                            .map(|t| t.to_string());
+                                    }
+                                }
+                                "tool_use" => {
+                                    if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                                        let id = block
+                                            .get("id")
+                                            .and_then(|i| i.as_str())
+                                            .unwrap_or_else(|| uuid::Uuid::new_v4().as_str())
+                                            .to_string();
+                                        let arguments = block
+                                            .get("input")
+                                            .map(|i| i.to_string())
+                                            .unwrap_or_else(|| "{}".to_string());
+                                        tool_calls.push(ToolCall { id, name: name.to_string(), arguments });
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            if text.is_none() {
+                for key in ["content", "text", "message", "choices"] {
+                    if let Some(val) = value.get(key) {
+                        if let Some(arr) = val.as_array() {
+                            if let Some(first) = arr.first() {
+                                for msg_key in ["message", "content"] {
+                                    if let Some(msg) = first.get(msg_key) {
+                                        if let Some(s) = msg.as_str().filter(|s| !s.is_empty()) {
+                                            text = Some(s.to_string());
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        } else if let Some(s) = val.as_str().filter(|s| !s.is_empty()) {
+                            text = Some(s.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if tool_calls.is_empty() {
+                if let Some(choices) = value.get("choices").and_then(|c| c.as_array()) {
+                    if let Some(first) = choices.first() {
+                        if let Some(msg) = first.get("message") {
+                            if let Some(tc) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                                for call in tc {
+                                    if let Some(func) = call.get("function") {
+                                        let id = call
+                                            .get("id")
+                                            .and_then(|i| i.as_str())
+                                            .unwrap_or_else(|| uuid::Uuid::new_v4().as_str())
+                                            .to_string();
+                                        let name = func
+                                            .get("name")
+                                            .and_then(|n| n.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let arguments = func
+                                            .get("arguments")
+                                            .map(|a| a.to_string())
+                                            .unwrap_or_else(|| "{}".to_string());
+                                        tool_calls.push(ToolCall { id, name, arguments });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        ExtractResult {
+            text,
+            tool_calls,
+        }
+    }
+}
+
+struct ExtractResult {
+    text: Option<String>,
+    tool_calls: Vec<ToolCall>,
 }
 
 /// A message in a multi-turn conversation, including tool interactions.
@@ -427,6 +630,17 @@ pub trait Provider: Send + Sync {
         // Create a single empty chunk to indicate not supported
         let chunk = StreamChunk::error(format!("{} does not support streaming", provider_name));
         stream::once(async move { Ok(chunk) }).boxed()
+    }
+
+    /// Parse a raw response once, caching intermediate results.
+    ///
+    /// This enables single-pass parsing for responses that may be accessed
+    /// multiple times (e.g., text extraction followed by tool call extraction).
+    /// The default implementation parses the raw string and caches the result.
+    fn parse_response_once(&self, response: CachedResponse) -> CachedResponse {
+        let mut response = response;
+        response.parse_once();
+        response
     }
 }
 
@@ -898,5 +1112,57 @@ mod tests {
         let message = err.to_string();
 
         assert!(message.contains("non-prompt-guided"));
+    }
+
+    #[test]
+    fn cached_response_parses_openai_response() {
+        let raw = r#"{"choices":[{"message":{"content":"Hello world","tool_calls":[{"id":"call_123","function":{"name":"shell","arguments":"{\"cmd\":\"ls\"}"}}]}}]}"#;
+        let mut cached = CachedResponse::new(raw);
+        let response = cached.parse_once();
+        assert_eq!(response.text.as_deref(), Some("Hello world"));
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "shell");
+    }
+
+    #[test]
+    fn cached_response_parses_anthropic_response() {
+        let raw = r#"{"content":[{"type":"text","text":"Hi there"},{"type":"tool_use","id":"call_456","name":"file_read","input":{"path":"/test.txt"}}]}"#;
+        let mut cached = CachedResponse::new(raw);
+        let response = cached.parse_once();
+        assert_eq!(response.text.as_deref(), Some("Hi there"));
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "file_read");
+    }
+
+    #[test]
+    fn cached_response_caches_on_subsequent_access() {
+        let raw = r#"{"choices":[{"message":{"content":"cached text"}}]}"#;
+        let mut cached = CachedResponse::new(raw);
+        
+        // First call parses
+        let _ = cached.parse_once();
+        
+        // Second call should use cached
+        let response = cached.parse_once();
+        assert_eq!(response.text.as_deref(), Some("cached text"));
+    }
+
+    #[test]
+    fn cached_response_text_method() {
+        let raw = r#"{"choices":[{"message":{"content":"direct text"}}]}"#;
+        let mut cached = CachedResponse::new(raw);
+        assert_eq!(cached.text(), "direct text");
+        // Second call should use cache
+        assert_eq!(cached.text(), "direct text");
+    }
+
+    #[test]
+    fn cached_response_tool_calls_method() {
+        let raw = r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","function":{"name":"test","arguments":"{}"}}]}}]}"#;
+        let mut cached = CachedResponse::new(raw);
+        assert_eq!(cached.tool_calls().len(), 1);
+        assert_eq!(cached.tool_calls()[0].name, "test");
+        // Second call should use cache
+        assert_eq!(cached.tool_calls().len(), 1);
     }
 }

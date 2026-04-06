@@ -6,11 +6,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
 use tokio::fs::File;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
+
+const CONFIG_CACHE_TTL_SECS: u64 = 5;
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "provider.anthropic",
@@ -46,6 +50,14 @@ const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] =
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
     OnceLock::new();
+
+struct ConfigCacheEntry {
+    config: Arc<Config>,
+    loaded_at: Instant,
+    config_path: PathBuf,
+}
+
+static CONFIG_CACHE: OnceLock<RwLock<Option<ConfigCacheEntry>>> = OnceLock::new();
 
 // ── Top-level config ──────────────────────────────────────────────
 
@@ -3248,6 +3260,47 @@ impl Config {
             );
             Ok(config)
         }
+    }
+
+    pub async fn load_cached() -> Result<Arc<Config>> {
+        let now = Instant::now();
+        let ttl = std::time::Duration::from_secs(CONFIG_CACHE_TTL_SECS);
+
+        if let Some(cache) = CONFIG_CACHE.get() {
+            if let Ok(guard) = cache.read() {
+                if let Some(entry) = guard.as_ref() {
+                    if now.duration_since(entry.loaded_at) < ttl {
+                        let cached_path = entry.config_path.clone();
+                        if let Ok(meta) = tokio::fs::metadata(&cached_path).await {
+                            if let Ok(modified) = meta.modified() {
+                                let loaded_time: std::time::SystemTime = entry.loaded_at.into();
+                                if modified < loaded_time {
+                                    tracing::debug!("Returning cached config");
+                                    return Ok(entry.config.clone());
+                                }
+                                tracing::debug!("Config file modified, invalidating cache");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let config = Config::load_or_init().await?;
+        let config_path = config.config_path.clone();
+        let entry = ConfigCacheEntry {
+            config: Arc::new(config),
+            loaded_at: now,
+            config_path,
+        };
+
+        if let Some(cached) = CONFIG_CACHE.get() {
+            if let Ok(mut guard) = cached.write() {
+                *guard = Some(entry);
+            }
+        }
+
+        Ok(entry.config)
     }
 
     /// Validate configuration values that would cause runtime failures.
