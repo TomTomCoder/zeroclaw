@@ -87,6 +87,7 @@ use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -120,6 +121,56 @@ impl Tool for ArcDelegatingTool {
     }
 }
 
+type ToolInitFn = Box<dyn FnOnce() -> Arc<dyn Tool> + Send + Sync>;
+
+pub struct ToolRegistry {
+    cells: HashMap<String, OnceCell<Arc<dyn Tool>>>,
+    init_fns: HashMap<String, ToolInitFn>,
+}
+
+impl ToolRegistry {
+    pub fn new() -> Self {
+        Self {
+            cells: HashMap::new(),
+            init_fns: HashMap::new(),
+        }
+    }
+
+    pub fn register<F>(&mut self, name: String, init_fn: F)
+    where
+        F: FnOnce() -> Arc<dyn Tool> + Send + Sync + 'static,
+    {
+        self.init_fns.insert(name.clone(), Box::new(init_fn));
+        self.cells.insert(name, OnceCell::new());
+    }
+
+    pub fn get_or_init_tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        let cell = self.cells.get(name)?;
+        let tool = cell.get_or_init(|| {
+            let init_fn = self.init_fns.get(name).expect("init_fn must exist");
+            init_fn()
+        });
+        Some(tool.clone())
+    }
+
+    pub fn get_all_tools(&self) -> Vec<Box<dyn Tool>> {
+        self.cells
+            .keys()
+            .filter_map(|name| self.get_or_init_tool(name).map(|t| Box::new(t) as Box<dyn Tool>))
+            .collect()
+    }
+
+    pub fn tool_names(&self) -> Vec<&str> {
+        self.cells.keys().cloned().collect()
+    }
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
 }
@@ -134,12 +185,30 @@ pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
-    vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
-        Box::new(FileReadTool::new(security.clone())),
-        Box::new(FileWriteTool::new(security.clone())),
-        Box::new(GlobSearchTool::new(security)),
-    ]
+    let mut registry = ToolRegistry::new();
+    
+    let sec = security.clone();
+    let rt = runtime.clone();
+    registry.register("shell".to_string(), move || {
+        Box::new(ShellTool::new(sec.clone(), rt.clone()))
+    });
+    
+    let sec = security.clone();
+    registry.register("file_read".to_string(), move || {
+        Box::new(FileReadTool::new(sec.clone()))
+    });
+    
+    let sec = security.clone();
+    registry.register("file_write".to_string(), move || {
+        Box::new(FileWriteTool::new(sec.clone()))
+    });
+    
+    let sec = security.clone();
+    registry.register("glob_search".to_string(), move || {
+        Box::new(GlobSearchTool::new(sec.clone()))
+    });
+    
+    registry.get_all_tools()
 }
 
 /// Create full tool registry including memory tools and optional Composio

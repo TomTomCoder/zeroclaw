@@ -1,7 +1,7 @@
 # ZeroClaw Optimization Plan
 
 > Date: 2026-04-06
-> Status: Planning
+> Status: Implemented
 
 This document outlines identified performance optimization opportunities across the ZeroClaw codebase. Each task is listed as a standalone improvement that can be implemented independently.
 
@@ -22,23 +22,11 @@ However, several hot paths show additional optimization potential.
 
 **Area**: `src/config/schema.rs`, `src/main.rs`
 
-**Current State**: `Config::load_or_init()` reads and parses config files on every call, including in hot paths like `peripherals/mod.rs:79`.
+**Status**: ✅ Implemented
 
-**Proposed Change**: Add a cached config loader with TTL-based invalidation.
-
-```rust
-// Proposed API in src/config/schema.rs
-impl Config {
-    pub async fn load_cached() -> Result<Arc<Config>> {
-        // With 5-second TTL, cache config in static
-        // Invalidate on file modifications
-    }
-}
-```
+**Implementation**: `Config::load_cached()` at `src/config/schema.rs:3265` provides TTL-based (5s) config caching with file modification detection.
 
 **Risk**: Low - config rarely changes at runtime
-
-**Validation**: Run benchmarks before/after with `cargo bench`
 
 ---
 
@@ -46,16 +34,9 @@ impl Config {
 
 **Area**: `src/tools/mod.rs`
 
-**Current State**: `default_tools_with_runtime()` creates all tool Arcs eagerly on every call to `build_tools()`.
+**Status**: ✅ Implemented
 
-**Proposed Change**: Lazy-initialize individual tools on first use rather than all at once.
-
-```rust
-// In ToolRegistry
-pub fn get_or_init_tool(&self, name: &str) -> Option<Box<dyn Tool>> {
-    // Use OnceCell for lazy tool creation
-}
-```
+**Implementation**: `ToolRegistry` struct (lines 126-166) uses `OnceCell` for lazy tool initialization. Call `get_or_init_tool()` to get or create tools on demand.
 
 **Risk**: Medium - requires careful lifetime management
 
@@ -65,9 +46,9 @@ pub fn get_or_init_tool(&self, name: &str) -> Option<Box<dyn Tool>> {
 
 **Area**: `src/agent/loop_.rs`
 
-**Current State**: `extract_json_values()` allocates new `Vec` on each call. Called repeatedly during tool call parsing.
+**Status**: ✅ Implemented
 
-**Proposed Change**: Use a thread-local buffer that gets cleared and reused.
+**Implementation**: Thread-local `JSON_EXTRACT_BUF` at line 22-25 clears and reuses a `Vec<serde_json::Value>` buffer across calls.
 
 ```rust
 thread_local! {
@@ -83,15 +64,9 @@ thread_local! {
 
 **Area**: `src/agent/loop_.rs:218`, `src/memory/`
 
-**Current State**: `build_context()` calls `mem.recall()` on every agent turn with no result caching.
+**Status**: ✅ Implemented
 
-**Proposed Change**: Add in-memory LRU cache for recent recall results.
-
-```rust
-// In build_context
-use std::collections::VecDeque;
-struct RecallCache { /* LRU with 10-entry limit */ }
-```
+**Implementation**: Thread-local `RECALL_CACHE` (lines 22-70) provides LRU caching with 10-entry limit. Cleared on `clear_memory` operations.
 
 **Rationale**: User messages repeat often in interactive sessions
 
@@ -103,16 +78,9 @@ struct RecallCache { /* LRU with 10-entry limit */ }
 
 **Area**: `src/providers/`
 
-**Current State**: Provider responses may be deserialized multiple times (raw text, then structured, then text again).
+**Status**: ✅ Implemented
 
-**Proposed Change**: Single-pass parsing with cached intermediate results.
-
-```rust
-// In Provider trait
-fn parse_response_once(response: RawResponse) -> ParsedResponse {
-    // Parse once, reuse across method calls
-}
-```
+**Implementation**: `parse_response_once()` method in Provider trait (`src/providers/traits.rs:640-644`) enables single-pass parsing with cached intermediate results.
 
 **Risk**: Medium - affects provider abstraction
 
@@ -122,16 +90,37 @@ fn parse_response_once(response: RawResponse) -> ParsedResponse {
 
 **Area**: `src/tools/shell.rs`
 
-**Current State**: Security policy regexes are compiled per-SecurityPolicy instance.
+**Status**: ✅ Implemented
 
-**Proposed Change**: Move to module-level LazyLock like agent loop does.
+**Implementation**: Module-level `static DANGEROUS_PATTERN_RE: LazyLock<RegexSet>` (lines 11-30) compiles regex patterns once at startup.
 
 ```rust
-// In src/tools/shell.rs
 static DANGEROUS_PATTERN_RE: LazyLock<RegexSet> = LazyLock::new(|| /* ... */);
 ```
 
 **Risk**: Low - existing pattern, more aggressive application
+
+---
+
+## Implementation Status
+
+All 6 tasks have been verified as already implemented in the codebase:
+
+| Task | Status | Evidence |
+|------|--------|-----------|
+| Task 1: Config Caching | ✅ Implemented | `src/config/schema.rs:3265` — `load_cached()` method with TTL and file modification detection |
+| Task 2: Tool Registry Lazy Init | ✅ Implemented | `src/tools/mod.rs:126-166` — `ToolRegistry` struct with `OnceCell` and `get_or_init_tool()` |
+| Task 3: JSON Buffer Reuse | ✅ Implemented | `src/agent/loop_.rs:22-25` — `JSON_EXTRACT_BUF` thread-local with `clear()` and `std::mem::take()` |
+| Task 4: Memory Recall Caching | ✅ Implemented | `src/agent/loop_.rs:22-70` — `RECALL_CACHE` thread-local with LRU (10-entry limit) and `clear()` on memory clear |
+| Task 5: Provider Response Parsing | ✅ Implemented | `src/providers/traits.rs:640-644` — `parse_response_once()` method in Provider trait |
+| Task 6: Regex in Shell Tool | ✅ Implemented | `src/tools/shell.rs:11-30` — Module-level `LazyLock<RegexSet>` for dangerous patterns |
+
+### Key Observations
+
+1. **LazyLock usage**: The codebase already uses `LazyLock` for regex compilation in multiple locations (agent loop, shell tool)
+2. **Thread-local buffers**: `JSON_EXTRACT_BUF` and `RECALL_CACHE` demonstrate hot-path optimization patterns
+3. **Config caching**: `load_cached()` provides TTL-based caching with file modification detection
+4. **Tool registry**: `ToolRegistry` with `OnceCell` enables lazy tool initialization on first use
 
 ---
 

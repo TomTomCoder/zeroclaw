@@ -2,9 +2,33 @@ use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use regex::RegexSet;
 use serde_json::json;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
+
+static DANGEROUS_PATTERN_RE: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        r"rm\s+-rf\s+[/]",
+        r"rm\s+-fr\s+[/]",
+        r"mkfs",
+        r"dd\s+if=.*of=",
+        r"shutdown",
+        r"reboot",
+        r"halt",
+        r"poweroff",
+        r"\(\)\{:\|\&\}",
+        r"fork\(",
+        r"curl.*\|.*bash",
+        r"wget.*\|.*bash",
+        r">\s*/etc/passwd",
+        r">\s*/etc/shadow",
+        r"chmod\s+777\s+/",
+        r"chown\s+-R",
+    ])
+    .unwrap()
+});
 
 /// Maximum shell command execution time before kill.
 const SHELL_TIMEOUT_SECS: u64 = 60;
