@@ -20,7 +20,7 @@ pub use store::{
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
 
 #[allow(clippy::needless_pass_by_value)]
-pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
+pub async fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
     match command {
         crate::CronCommands::List => {
             let jobs = list_jobs(config)?;
@@ -160,6 +160,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             println!("▶️  Resumed cron job {id}");
             Ok(())
         }
+        crate::CronCommands::StartAll { run } => start_all_jobs(config, run).await,
     }
 }
 
@@ -198,6 +199,45 @@ pub fn resume_job(config: &Config, id: &str) -> Result<CronJob> {
             ..CronJobPatch::default()
         },
     )
+}
+
+pub async fn start_all_jobs(config: &Config, run_immediately: bool) -> Result<()> {
+    let jobs = list_jobs(config)?;
+    let mut enabled_count = 0;
+    let mut already_enabled = 0;
+
+    for job in jobs {
+        if job.enabled {
+            already_enabled += 1;
+            if run_immediately {
+                let (success, output) = scheduler::execute_job_now(config, &job).await;
+                let status = if success { "ok" } else { "error" };
+                println!(
+                    "▶️  Executed {}: {}",
+                    job.id,
+                    if success { "ok" } else { output.lines().next().unwrap_or("error").chars().take(50).collect::<String>() }
+                );
+                record_last_run(config, &job.id, success, output)?;
+            }
+        } else {
+            let _ = update_job(
+                config,
+                &job.id,
+                CronJobPatch {
+                    enabled: Some(true),
+                    ..CronJobPatch::default()
+                },
+            )?;
+            enabled_count += 1;
+            println!("▶️  Enabled cron job {}", job.id);
+        }
+    }
+
+    println!(
+        "\n✅ Started all jobs: {} enabled, {} were already running",
+        enabled_count, already_enabled
+    );
+    Ok(())
 }
 
 fn parse_delay(input: &str) -> Result<chrono::Duration> {

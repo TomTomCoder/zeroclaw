@@ -598,6 +598,21 @@ enum CronCommands {
         /// Task ID
         id: String,
     },
+    /// Start all paused cron tasks (enable and run each enabled task immediately)
+    #[command(long_about = "\
+Enable all paused cron tasks and optionally run them immediately.
+
+This is useful after a system restart or to kick off all scheduled tasks at once.
+Use --run to immediately execute each enabled task.
+
+Examples:
+  zeroclaw cron start-all
+  zeroclaw cron start-all --run")]
+    StartAll {
+        /// Immediately run each enabled task after enabling
+        #[arg(long, short)]
+        run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -925,7 +940,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
+        Commands::Cron { cron_command } => cron::handle_command(cron_command, &config).await,
 
         Commands::Models { model_command } => match model_command {
             ModelCommands::Refresh { provider, force } => {
